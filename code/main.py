@@ -2,9 +2,10 @@ import json
 from datetime import datetime
 import mgrs
 import pyproj
+import requests
 
 
-MGRS_PRECISION = 3 # 5: 1m, 4: 10m, 3: 100m, 2: 1km, 1: 10km, 0: 100km
+MGRS_PRECISION = 2 # 5: 1m, 4: 10m, 3: 100m, 2: 1km, 1: 10km, 0: 100km
 MGRS_SIZE = 10 ** (5 - MGRS_PRECISION)
 
 mgrs = mgrs.MGRS()
@@ -33,7 +34,16 @@ class Prediction:
         self.grid = mgrs.toMGRS(self.prediction["lat"], self.prediction["lon"], MGRSPrecision=MGRSPrecision)
 
 
-def filter_predictions():
+def get_sondehub_sites():
+    """
+    Download sites list from SondeHub API.
+    """
+
+    response = requests.get("https://api.v2.sondehub.org/sites")
+    response.raise_for_status()
+    return response.json()
+
+def filter_raw_predictions():
     """
     Only include predictions without an assigned launch site.
     """
@@ -68,6 +78,52 @@ def read_predictions(file_name):
 
     return predictions
 
+def prediction_stats(predictions):
+    """
+    Print out some stats about the predictions.
+    """
+
+    print("Total predictions: {}".format(len(predictions)))
+
+
+def filter_predictions(predictions, areas=[]):
+    """
+    Given a list of predictions filter out the ones that are in the provided areas (lat_min	lat_max	lon_min	lon_max).
+    """
+
+    filtered = {}
+
+    for prediction in predictions.values():
+        remove_prediction = False
+        for area in areas:
+            if prediction.prediction["lat"] > area[0] and prediction.prediction["lat"] < area[1] and prediction.prediction["lon"] > area[2] and prediction.prediction["lon"] < area[3]:
+                remove_prediction = True
+                break
+        if not remove_prediction:
+            filtered[prediction.id] = prediction
+
+    return filtered
+
+
+def filter_assigned_predictions(predictions, sondehub_sites, radius=3000):
+    """
+    Given a list of predictions filter out the ones that are within an x metre radius of a launch site.
+    """
+
+    filtered = {}
+
+    for prediction in predictions.values():
+        remove_prediction = False
+        for site in sondehub_sites:
+            location = sondehub_sites[site]["position"]
+            if geod.line_length([prediction.prediction["lon"], location[0]], [prediction.prediction["lat"], location[1]]) < radius:
+                remove_prediction = True
+                break
+        if not remove_prediction:
+            filtered[prediction.id] = prediction
+
+    return filtered
+
 
 def assign_grid(predictions, MGRSPrecision=MGRS_PRECISION):
     """
@@ -101,23 +157,44 @@ def assign_grid(predictions, MGRSPrecision=MGRS_PRECISION):
     return grid
 
 
-def get_most_common_grid(grid):
+def filter_grids(grid, threshold=None, limit=None):
     """
-    Given a grid return the most common grid.
+    Return a list of grids of length limit with a count above the threshold or highest count if threshold is None.
     """
 
-    max_count = 0
-    max_grid = None
+    grids = []
 
     for grid, data in grid.items():
-        if data["count"] > max_count:
-            max_count = data["count"]
-            max_grid = grid
+        if threshold is None or data["count"] >= threshold:
+            grids.append((grid, data["count"]))
 
-    return max_grid
+    grids.sort(key=lambda x: x[1], reverse=True)
+
+    return grids[:limit]
 
 
-def generate_geojson(grid, predictions, target_grid=None):
+def get_grid_estimated_launch(target_grid, predictions):
+    """
+    Return the avergae position of all the predictions in the grid.
+    """
+
+    lat_sum = 0
+    lon_sum = 0
+    count = 0
+
+    for prediction in predictions.values():
+        if prediction.grid == target_grid:
+            lat_sum += prediction.prediction["lat"]
+            lon_sum += prediction.prediction["lon"]
+            count += 1
+
+    lat_avg = round(lat_sum / count, 7)
+    lon_avg = round(lon_sum / count, 7)
+
+    return [lat_avg, lon_avg]
+
+
+def generate_geojson(grid, predictions, target_grid):
     """
     Generate a geojson file with all the bounding boxes.
     """
@@ -128,8 +205,10 @@ def generate_geojson(grid, predictions, target_grid=None):
     }
 
     for grid, data in grid.items():
-        if target_grid is not None and grid != target_grid:
+        if grid != target_grid:
             continue
+
+        # add a bounding box for each grid
         geojson["features"].append({
             "type": "Feature",
             "geometry": {
@@ -154,7 +233,7 @@ def generate_geojson(grid, predictions, target_grid=None):
                     "type": "Feature",
                     "geometry": {
                         "type": "Point",
-                        "coordinates": [prediction.prediction["lon"], prediction.prediction["lat"]]
+                        "coordinates": [round(prediction.prediction["lon"], 7), round(prediction.prediction["lat"], 7)]
                     },
                     "properties": {
                         "id": prediction.id,
@@ -167,11 +246,36 @@ def generate_geojson(grid, predictions, target_grid=None):
                     }
                 })
 
-    with open('data/geojson.json', 'w') as f:
+        # add a marker for the estimated launch site
+        lat_avg, lon_avg = get_grid_estimated_launch(grid, predictions)
+        geojson["features"].append({
+            "type": "Feature",
+            "geometry": {
+                "type": "Point",
+                "coordinates": [lon_avg, lat_avg]
+            },
+            "properties": {
+                "id": "estimated",
+                "serial": "estimated",
+                "type": "estimated",
+                "subtype": "estimated",
+                "datetime": "estimated",
+                "alt": "estimated",
+                "launch_site": "estimated"
+            }
+        })
+
+
+    with open('results/geojson-{}.json'.format(target_grid), 'w') as f:
         json.dump(geojson, f)
 
 
 if __name__ == "__main__":
+    sondehub_sites = get_sondehub_sites()
     predictions = read_predictions('data/filtered.json')
+    predictions = filter_predictions(predictions, areas=[(29.4533796, 33.3356317, 34.2674994, 35.8950234)])
+    predictions = filter_assigned_predictions(predictions, sondehub_sites)
     grid = assign_grid(predictions)
-    generate_geojson(grid, predictions, get_most_common_grid(grid))
+    top = filter_grids(grid, threshold=10)
+    for grid_id, count in top:
+        generate_geojson(grid, predictions, grid_id)
